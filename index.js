@@ -31,10 +31,16 @@ try {
   process.exit(1);
 }
 
-// Basenames to skip without hitting upstream (system / vendor PDBs you do not host).
-// Matched case-insensitively against the last path segment (works with /name.pdb/GUID/name.pdb).
-const skipBasenames = new Set(
+/**
+ * Symbol stems (name.pdb) that will never live on a private product symbol store.
+ * Matched against the SymSrv folder segment, so .pdb / .pd_ / file.ptr all short-circuit.
+ * Local response is 403 so clients stop probing deeper (unlike 404, which triggers .pd_).
+ *
+ * Do NOT put first-party stems here (obs*, libobs*, win-capture, mediasoup-*, …).
+ */
+const DENY_STEMS = new Set(
   [
+    // Original fast-skip list
     'ntdll.pdb',
     'kernelbase.pdb',
     'gdi32full.pdb',
@@ -54,8 +60,164 @@ const skipBasenames = new Set(
     'nvcuda.pdb',
     'nvapi64.pdb',
     'TextShaping.pdb',
-  ].map((name) => name.toLowerCase())
+
+    // Core Windows / Win32 (from real slobs-symbol traffic)
+    'kernel32.pdb',
+    'user32.pdb',
+    'win32u.pdb',
+    'gdi32.pdb',
+    'ucrtbase.pdb',
+    'rpcrt4.pdb',
+    'combase.pdb',
+    'msvcp_win.pdb',
+    'ole32.pdb',
+    'oleaut32.pdb',
+    'advapi32.pdb',
+    'msvcrt.pdb',
+    'sechost.pdb',
+    'ws2_32.pdb',
+    'avrt.pdb',
+    'winmm.pdb',
+    'powrprof.pdb',
+    'pdh.pdb',
+    'version.pdb',
+    'secur32.pdb',
+    'bcrypt.pdb',
+    'bcryptprimitives.pdb',
+    'sspicli.pdb',
+    'wldap32.pdb',
+    'crypt32.pdb',
+    'cryptbase.pdb',
+    'cryptsp.pdb',
+    'cryptnet.pdb',
+    'imm32.pdb',
+    'UMPDC.pdb',
+    'umppc.pdb',
+    'shcore.pdb',
+    'shlwapi.pdb',
+    'Kernel.Appcore.pdb',
+    'ntmarta.pdb',
+    'perfos.pdb',
+    'PfClient.pdb',
+    'rtworkq.pdb',
+    'uxtheme.pdb',
+    'WscApi.pdb',
+    'CLBCatQ.pdb',
+    'cfgmgr32.pdb',
+    'profapi.pdb',
+    'msasn1.pdb',
+    'wldp.pdb',
+    'drvstore.pdb',
+    'devobj.pdb',
+    'imagehlp.pdb',
+    'rsaenh.pdb',
+    'WinTypes.pdb',
+    'msdmo.pdb',
+    'setupapi.pdb',
+    'dbghelp.pdb',
+    'userenv.pdb',
+    'winhttp.pdb',
+    'DWrite.pdb',
+    'winspool.pdb',
+    'dhcpcsvc.pdb',
+    'dhcpcsvc6.pdb',
+    'dpapi.pdb',
+    'avicap32.pdb',
+    'msvfw32.pdb',
+    'comctl32v582.pdb',
+    'gdiplus.pdb',
+    'msctf.pdb',
+    'mswsock.pdb',
+    'dnsapi.pdb',
+    'dsparse.pdb',
+    'nsi.pdb',
+    'rasadhlp.pdb',
+    'fwpuclnt.pdb',
+    'hid.pdb',
+    'devenum.pdb',
+    'opengl32.pdb',
+    'glu32.pdb',
+    'schannel.pdb',
+    'MMDevAPI.pdb',
+    'audioses.pdb',
+    'Windows.UI.pdb',
+    'ncrypt.pdb',
+    'ntasn1.pdb',
+    'ncryptsslp.pdb',
+    'ResourcePolicyClient.pdb',
+    'WindowsCodecs.pdb',
+    'nlansp_c.pdb',
+    'wtsapi32.pdb',
+    'winsta.pdb',
+    'mscms.pdb',
+    'icm32.pdb',
+    'quartz.pdb',
+    'wkscli.pdb',
+    'netutils.pdb',
+    'qcap.pdb',
+    'MFKsProxy.pdb',
+    'atl.pdb',
+    'mfsensorgroup.pdb',
+    'MFPLAT.pdb',
+    'FrameServerMonitorClient.pdb',
+    'policymanager.pdb',
+    'mfcore.pdb',
+    'FrameServerClient.pdb',
+    'gpapi.pdb',
+    'Windows.Media.MediaControl.pdb',
+    'MFReadWrite.pdb',
+    'kswdmcap.pdb',
+    'vidcap.pdb',
+    'msimg32.pdb',
+    'msxml3.pdb',
+    'coml2.pdb',
+    'WINMMBASE.pdb',
+    'wdmaud.pdb',
+    'wdmaud2.pdb',
+    'msacm32.pdb',
+    'midimap.pdb',
+    'dcomp.pdb',
+    'Microsoft.Internal.WarpPal.pdb',
+    'dwmapi.pdb',
+    'dxgi.pdb',
+    'd3d9.pdb',
+    'd3d11.pdb',
+    'DXCore.pdb',
+    'directxdatabasehelper.pdb',
+
+    // MSVC redistributable
+    'vcruntime140.amd64.pdb',
+    'vcruntime140_1.amd64.pdb',
+    'msvcp140.amd64.pdb',
+
+    // NVIDIA driver / toolkit (not product store)
+    'nvldumdx.pdb',
+    'nvgpucomp64.pdb',
+    'NvMemMapStoragex.pdb',
+    'nvwgf2umx.pdb',
+    'NVAudioEffects.pdb',
+    'NVTRTLogger.pdb',
+    'nvapi64_impl.pdb',
+    'nvdxgdmal.pdb',
+    'nvobjectloader.pdb',
+    'nvEncodeAPI64.pdb',
+    'NvVirtualCameraFilter_x64.pdb',
+
+    // CEF / Chromium shipping beside the app but not on private store
+    'libcef.dll.pdb',
+    'chrome_elf.dll.pdb',
+
+    // Other third-party never on store (from real traffic)
+    'libcrypto-1_1-x64.pdb',
+    'LogiCam.pdb',
+  ].map((s) => s.toLowerCase())
 );
+
+// After upstream proves a SymSrv folder is empty (.pd_ miss), remember it for this process.
+// Key: "name.pdb/<guid>" (lowercased). Value: timestamp ms.
+const deadFolders = new Map();
+const DEAD_FOLDER_TTL_MS = 60 * 60 * 1000; // 1h; process restart clears too
+const DEAD_FOLDER_MAX = 5000;
 
 function requestPathname(urlPath) {
   const noQuery = (urlPath || '/').split('?')[0];
@@ -66,22 +228,98 @@ function requestPathname(urlPath) {
   }
 }
 
-function basenameOfUrlPath(urlPath) {
+/**
+ * Parse SymSrv-style path:
+ *   /symbols/foo.pdb/<GUID>/foo.pdb
+ *   /symbols/foo.pdb/<GUID>/foo.pd_
+ *   /symbols/foo.pdb/<GUID>/file.ptr
+ *   /symbols/index2.txt
+ */
+function parseSymbolPath(urlPath) {
   const pathname = requestPathname(urlPath);
-  const base = path.posix.basename(pathname);
-  return base.toLowerCase();
+  const parts = pathname.split('/').filter(Boolean);
+  const leaf = (parts[parts.length - 1] || '').toLowerCase();
+
+  // Prefer the folder segment that ends with .pdb (SymSrv layout).
+  let stem = null;
+  let stemIdx = -1;
+  for (let i = 0; i < parts.length; i++) {
+    const p = parts[i];
+    if (/\.pdb$/i.test(p)) {
+      stem = p.toLowerCase();
+      stemIdx = i;
+      break;
+    }
+  }
+
+  // Fallback: leaf foo.pd_ → foo.pdb
+  if (!stem && /\.pd_$/i.test(leaf)) {
+    stem = `${leaf.slice(0, -4)}.pdb`;
+  } else if (!stem && /\.pdb$/i.test(leaf)) {
+    stem = leaf;
+  }
+
+  let guid = null;
+  if (stemIdx >= 0 && parts[stemIdx + 1]) {
+    guid = parts[stemIdx + 1].toLowerCase();
+  }
+
+  const folderKey = stem && guid ? `${stem}/${guid}` : null;
+
+  let kind = 'other';
+  if (leaf === 'index2.txt' || leaf === 'index.txt' || leaf === 'pingme.txt') {
+    kind = 'index';
+  } else if (leaf === 'file.ptr') {
+    kind = 'ptr';
+  } else if (/\.pd_$/i.test(leaf)) {
+    kind = 'pd_';
+  } else if (/\.pdb$/i.test(leaf)) {
+    kind = 'pdb';
+  }
+
+  return { pathname, leaf, stem, guid, folderKey, kind };
+}
+
+function pruneDeadFolders(now) {
+  if (deadFolders.size <= DEAD_FOLDER_MAX) {
+    for (const [k, t] of deadFolders) {
+      if (now - t > DEAD_FOLDER_TTL_MS) deadFolders.delete(k);
+    }
+    return;
+  }
+  // Hard cap: drop oldest half
+  const entries = [...deadFolders.entries()].sort((a, b) => a[1] - b[1]);
+  const drop = Math.ceil(entries.length / 2);
+  for (let i = 0; i < drop; i++) deadFolders.delete(entries[i][0]);
+}
+
+function markFolderDead(folderKey) {
+  if (!folderKey) return;
+  const now = Date.now();
+  deadFolders.set(folderKey, now);
+  if (deadFolders.size > DEAD_FOLDER_MAX) pruneDeadFolders(now);
+}
+
+function isFolderDead(folderKey) {
+  if (!folderKey) return false;
+  const t = deadFolders.get(folderKey);
+  if (t == null) return false;
+  if (Date.now() - t > DEAD_FOLDER_TTL_MS) {
+    deadFolders.delete(folderKey);
+    return false;
+  }
+  return true;
 }
 
 function joinRemoteUrl(reqUrl) {
-  // Preserve path + query from the inbound request on top of the remote origin/base path.
   const inbound = new URL(reqUrl || '/', 'http://localhost');
   const target = new URL(remoteBase.href);
   const basePath = remoteBase.pathname.replace(/\/+$/, '');
   const reqPath = inbound.pathname.startsWith('/') ? inbound.pathname : `/${inbound.pathname}`;
   target.pathname = `${basePath}${reqPath}`.replace(/\/{2,}/g, '/');
-    target.search = inbound.search;
-    return target;
-  }
+  target.search = inbound.search;
+  return target;
+}
 
 function discardBody(stream) {
   stream.resume();
@@ -95,7 +333,7 @@ function sendEmpty(res, statusCode) {
 }
 
 /**
- * GET upstream. Follows redirects. Invokes onResponse(err, incomingMessage, request).
+ * GET upstream. Follows redirects. Invokes onResponse(err, incomingMessage).
  * Returns the active ClientRequest so the caller can abort on client disconnect.
  */
 function upstreamGet(url, redirectsLeft, onResponse) {
@@ -105,7 +343,6 @@ function upstreamGet(url, redirectsLeft, onResponse) {
     {
       timeout: UPSTREAM_TIMEOUT_MS,
       headers: {
-        // Prefer identity so we can forward Content-Length when present.
         'Accept-Encoding': 'identity',
       },
     },
@@ -122,11 +359,10 @@ function upstreamGet(url, redirectsLeft, onResponse) {
         }
         console.log(`Redirect ${code} → ${next.href}`);
         const child = upstreamGet(next, redirectsLeft - 1, onResponse);
-        // Re-bind destroy so client abort cancels the latest hop.
         req._proxysymChild = child;
         return;
       }
-      onResponse(null, upRes, req);
+      onResponse(null, upRes);
     }
   );
 
@@ -152,10 +388,6 @@ function upstreamGet(url, redirectsLeft, onResponse) {
   return req;
 }
 
-/**
- * Respond with a full body that always has Content-Length (never chunked).
- * symchk does not handle Transfer-Encoding: chunked.
- */
 function sendBodyWithLength(res, statusCode, contentType, bodyBuf) {
   if (res.headersSent || res.writableEnded) return;
   res.statusCode = statusCode;
@@ -169,7 +401,6 @@ function pipeOrBufferOk(upRes, res) {
   const lenHeader = upRes.headers['content-length'];
 
   if (lenHeader && /^\d+$/.test(String(lenHeader))) {
-    // Fast path: upstream length known → stream and keep Content-Length (no chunked).
     res.statusCode = 200;
     res.setHeader('Content-Type', contentType);
     res.setHeader('Content-Length', String(lenHeader));
@@ -187,7 +418,6 @@ function pipeOrBufferOk(upRes, res) {
     return;
   }
 
-  // No Content-Length (or non-numeric): buffer entire body, then send with length.
   const chunks = [];
   let total = 0;
   upRes.on('data', (chunk) => {
@@ -214,11 +444,26 @@ const server = http.createServer((req, res) => {
   }
 
   const urlPath = req.url || '/';
-  const base = basenameOfUrlPath(urlPath);
+  const parsed = parseSymbolPath(urlPath);
 
-  if (base && skipBasenames.has(base)) {
-    console.log(`Skip (local): ${urlPath} → 404`);
-    sendEmpty(res, 404);
+  // Useless listing / ping files on private stores.
+  if (parsed.kind === 'index') {
+    console.log(`Deny (index): ${urlPath} → 403`);
+    sendEmpty(res, 403);
+    return;
+  }
+
+  // Static deny: whole symbol family (.pdb / .pd_ / file.ptr) → 403 so client stops.
+  if (parsed.stem && DENY_STEMS.has(parsed.stem)) {
+    console.log(`Deny (stem ${parsed.stem}): ${urlPath} → 403`);
+    sendEmpty(res, 403);
+    return;
+  }
+
+  // Learned empty folder (after upstream .pd_ miss, etc.).
+  if (parsed.folderKey && isFolderDead(parsed.folderKey)) {
+    console.log(`Deny (cached miss ${parsed.folderKey}): ${urlPath} → 403`);
+    sendEmpty(res, 403);
     return;
   }
 
@@ -253,12 +498,27 @@ const server = http.createServer((req, res) => {
 
     const code = upRes.statusCode || 0;
 
-    // Core purpose of this proxy: S3 "no such key" often arrives as 403; map to 404
-    // so symchk / VS still try the compressed .pd_ twin.
-    if (code === 403) {
+    // S3 "no such key" → 403. Map to 404 so symchk/VS still try .pd_ (core purpose).
+    // After a compressed twin also misses, mark the GUID folder dead → later probes get 403.
+    if (code === 403 || code === 404) {
       settled = true;
       discardBody(upRes);
-      console.log(`Mapped upstream 403 → 404 for ${urlPath}`);
+
+      if (parsed.kind === 'pd_' || parsed.kind === 'ptr') {
+        // .pd_ gone (or ptr) ⇒ nothing left in this folder worth fetching.
+        markFolderDead(parsed.folderKey);
+        console.log(
+          `Mapped upstream ${code} → 404 for ${urlPath}` +
+            (parsed.folderKey ? ` (folder cached dead: ${parsed.folderKey})` : '')
+        );
+      } else if (code === 403) {
+        console.log(`Mapped upstream 403 → 404 for ${urlPath}`);
+      } else {
+        console.log(`Upstream 404 for ${urlPath}`);
+      }
+
+      // Always 404 to the client for upstream miss on first-party-unknown paths so
+      // a .pdb miss still allows the .pd_ attempt. Folder cache handles the rest with 403.
       sendEmpty(res, 404);
       return;
     }
@@ -310,6 +570,7 @@ const server = http.createServer((req, res) => {
 server.listen(serverPort, () => {
   console.log(`proxysymckh listening on http://localhost:${serverPort}`);
   console.log(`Upstream: ${remoteBase.href}`);
+  console.log(`Deny stems: ${DENY_STEMS.size}; negative-cache TTL ${DEAD_FOLDER_TTL_MS / 1000}s`);
 });
 
 server.on('error', (err) => {
