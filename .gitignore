@@ -1,1 +1,8 @@
 node_modules/
+.yarn/
+.yarnrc.yml
+yarn.lock
+package-lock.json
+npm-debug.log*
+.DS_Store
+*.log

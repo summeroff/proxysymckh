@@ -1,63 +1,93 @@
-# Node.js proxy server for symchk 
+# Node.js proxy server for symchk
 
-This Node.js script sets up a web server that serve files from real symbol server.
+Local HTTP proxy in front of a private symbol store (often S3) so **symchk** and **Visual Studio** can fetch PDBs reliably.
 
-There is two issues with symchk tool: 
-1. 403 on pdb makes it skip pd_ file
-2. it does not understand chunked response 
+## Problems this solves
 
-If you store your debug info in an AWS S3 bucket with the "ListBucket" permission disabled, it is important to note that the server will return a `403` error for files that do not exist. This can cause issues with tools like `symchk` and `Visual Studio`, which check for `.pdb` files and attempt to retrieve `.pd_` files if the `.pdb` file is not found.
+1. **403 on missing keys** — S3 with `ListBucket` disabled returns `403` for objects that do not exist. `symchk` / VS treat `403` as “stop” and never try the compressed `.pd_` twin. A `404` makes them continue.
+2. **Chunked responses** — `symchk` does not handle `Transfer-Encoding: chunked`. This proxy always answers successful downloads with a real **`Content-Length`** (stream when upstream provides length; otherwise buffer then send).
+3. **Noisy system PDB traffic** — optional local skip list returns `404` for known Windows/NVIDIA PDB basenames without hitting upstream (paths like `/ntdll.pdb/<GUID>/ntdll.pdb` match by basename).
 
-If the server returns a `404` error for a missing `.pdb` file, these tools will attempt to retrieve the `.pd_` file, which is a compressed version of the `.pdb` file. However, if the server returns a `403` error, these tools will skip the request for the `.pd_` file and may not be able to correctly load the necessary debugging information.
+No npm dependencies — Node.js standard library only.
 
-To avoid this issue, ensure that your AWS S3 bucket has the necessary permissions to allow access to the `.pdb` files and to return a `404` error for missing files, rather than a `403` error. This will ensure that tools like `symchk` and `Visual Studio` can correctly retrieve the necessary debugging information.
+## Requirements
 
-## Installation
+- [Node.js](https://nodejs.org/) 18+ (20/22 fine)
 
-To install this script, you'll need to have Node.js and Yarn installed on your machine.
+## Install
 
-1. Clone this repository to your local machine.
-2. Navigate to the root directory of the repository in your terminal.
-3. Run `yarn install` to install the required dependencies.
+```bash
+git clone https://github.com/summeroff/proxysymckh.git
+cd proxysymckh
+# nothing to install
+```
 
 ## Usage
 
-To start the proxy server, run the following command in the root directory of the repository:
+```bash
+node index.js <remote-server-url> [port]
+```
 
-```yarn start https://yoursymbolsserver.com```
+| Argument | Required | Default | Example |
+|----------|----------|---------|---------|
+| remote-server-url | yes | — | `https://yoursymbolsserver.com` or `https://bucket.s3.amazonaws.com/symbols` |
+| port | no | `3000` | `4000` |
 
-This will start the Node.js server on port `3000`. You can then send HTTP requests to `http://localhost:3000` to have them forwarded to the debug symbols storage server.
+Examples:
 
-## Using with custom port and server
+```bash
+node index.js https://yoursymbolsserver.com
+node index.js https://yoursymbolsserver.com 4000
+npm start -- https://yoursymbolsserver.com 3000
+```
 
-Or you can provide port and server url when starting a proxy.
+Point clients at `http://localhost:3000` (or your port). Inbound paths are appended to the remote base URL.
 
-```yarn start https://yoursymbolsserver.com 4000```
+## Visual Studio
 
-## Using with Visual Studio
-
-To use this proxy server with `Visual Studio`, follow these steps:
-
-1. Open your Visual Studio project and go to **Tools** > **Options** > **Debugging** > **Symbols**.
-2. Add a new symbol file location with the following settings:
-   - **Symbol file location:** `http://localhost:3000/symbols`
-3. Click **OK** to save the settings.
-
-`Visual Studio` will now download symbols from the local proxy server when debugging your project.
+1. **Tools** → **Options** → **Debugging** → **Symbols**
+2. Add symbol file location: `http://localhost:3000`  
+   (or `http://localhost:3000/symbols` if that matches how your upstream is laid out)
+3. **OK**
 
 ## Testing with symchk
 
-To test the local proxy server with `symchk`, follow these steps:
+1. Pick a binary whose PDB lives on your symbol server.
+2. Open a prompt where `symchk` is available (often  
+   `C:\Program Files (x86)\Windows Kits\10\Debuggers\x64`).
+3. Run (adjust paths):
 
-1. Get a path to a binary what you want to debug with debug symbols on your server.
-2. Open a command prompt and navigate to the directory where you have `symchk` installed. Usually `C:\Program Files (x86)\Windows Kits\10\Debuggers\x64`.
-3. Run the following command, replacing `<path to binary>` with the path to your file and `c:\some_temp` with some temp directory:
-
-```symchk /vvvv "<path to binary>" /s srv*c:\some_temp*http://localhost:3000/symbols```
-
-4. If the local proxy server is running and working correctly, `symchk` should download the symbols successfully and finish output the following message:
-
+```bat
+symchk /vvvv "<path to binary>" /s srv*c:\some_temp*http://localhost:3000
 ```
+
+If the layout on the server includes a `/symbols` prefix, use that in the URL:
+
+```bat
+symchk /vvvv "<path to binary>" /s srv*c:\some_temp*http://localhost:3000/symbols
+```
+
+Successful-ish summary lines look like:
+
+```text
 SYMCHK: FAILED files = 0
 SYMCHK: PASSED + IGNORED files = 1
 ```
+
+## Behavior notes
+
+| Upstream | Proxy responds |
+|----------|----------------|
+| `200` + `Content-Length` | `200`, same length, streamed |
+| `200` without length | `200`, body buffered, `Content-Length` set |
+| `403` | `404` (empty) |
+| other 4xx/5xx | same status (empty body) |
+| skip-list basename | `404` without upstream call |
+| redirect (3xx) | followed (max 5) |
+| client disconnect | upstream request aborted |
+
+Skip list is the hardcoded basename set in `index.js` (ntdll, kernelbase, common NVIDIA CUDA PDBs, etc.). Edit the array if you need different names.
+
+## License
+
+MIT

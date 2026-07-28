@@ -1,13 +1,13 @@
 {
-  "name": "sub-symbols",
-  "version": "1.0.0",
+  "name": "proxysymckh",
+  "version": "1.1.0",
+  "description": "Local symbol-server proxy: map S3 403→404 and never emit chunked responses (symchk/VS).",
   "main": "index.js",
   "license": "MIT",
   "scripts": {
     "start": "node index.js"
   },
-  "dependencies": {
-    "http": "^0.0.1-security",
-    "http-proxy": "^1.18.1"
+  "engines": {
+    "node": ">=18"
   }
 }
