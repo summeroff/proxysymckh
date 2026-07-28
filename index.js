@@ -3,11 +3,13 @@
 const http = require('http');
 const https = require('https');
 const { URL } = require('url');
-const path = require('path');
+const net = require('net');
 
 const DEFAULT_PORT = 3000;
 const UPSTREAM_TIMEOUT_MS = 60_000;
 const MAX_REDIRECTS = 5;
+/** Cap when buffering a body that has no Content-Length (avoids OOM). */
+const MAX_BUFFER_BYTES = 512 * 1024 * 1024; // 512 MiB
 
 const args = process.argv.slice(2);
 if (args.length < 1 || args[0] === '-h' || args[0] === '--help') {
@@ -332,7 +334,56 @@ function sendEmpty(res, statusCode) {
 }
 
 /**
- * GET upstream. Follows redirects. Invokes onResponse(err, incomingMessage).
+ * Block open redirects into unexpected private targets (SSRF).
+ * Always allow hops that stay on the configured upstream host or the current
+ * response host (so local dev + same-host S3 redirects work). Cross-host hops
+ * must be public http(s) only.
+ */
+function isForbiddenRedirectTarget(nextUrl, fromUrl) {
+  if (nextUrl.protocol !== 'http:' && nextUrl.protocol !== 'https:') {
+    return `unsupported protocol ${nextUrl.protocol}`;
+  }
+  if (nextUrl.username || nextUrl.password) {
+    return 'URL userinfo not allowed';
+  }
+  const host = (nextUrl.hostname || '').toLowerCase().replace(/^\[|\]$/g, '');
+  if (!host) return 'empty host';
+
+  const configured = (remoteBase.hostname || '').toLowerCase().replace(/^\[|\]$/g, '');
+  const previous = (fromUrl.hostname || '').toLowerCase().replace(/^\[|\]$/g, '');
+  if (host === configured || host === previous) {
+    return null;
+  }
+
+  if (host === 'localhost' || host.endsWith('.localhost') || host === 'metadata.google.internal') {
+    return `blocked host ${host}`;
+  }
+
+  if (net.isIP(host) === 4) {
+    const [a, b] = host.split('.').map((x) => parseInt(x, 10));
+    if (a === 0 || a === 10 || a === 127) return `blocked IPv4 ${host}`;
+    if (a === 169 && b === 254) return `blocked IPv4 ${host}`;
+    if (a === 192 && b === 168) return `blocked IPv4 ${host}`;
+    if (a === 172 && b >= 16 && b <= 31) return `blocked IPv4 ${host}`;
+  } else if (net.isIP(host) === 6) {
+    const h = host.toLowerCase();
+    if (h === '::1' || h.startsWith('fe80:') || h.startsWith('fc') || h.startsWith('fd')) {
+      return `blocked IPv6 ${host}`;
+    }
+    if (h.includes('.')) {
+      const m = h.match(/(\d+\.\d+\.\d+\.\d+)$/);
+      if (m) {
+        const fake = new URL(`http://${m[1]}/`);
+        const why = isForbiddenRedirectTarget(fake, fromUrl);
+        if (why) return why;
+      }
+    }
+  }
+  return null;
+}
+
+/**
+ * GET upstream. Follows redirects (public hosts only). Invokes onResponse(err, incomingMessage).
  * Returns the active ClientRequest so the caller can abort on client disconnect.
  */
 function upstreamGet(url, redirectsLeft, onResponse) {
@@ -354,6 +405,11 @@ function upstreamGet(url, redirectsLeft, onResponse) {
           next = new URL(upRes.headers.location, url);
         } catch (err) {
           onResponse(new Error(`Bad redirect Location: ${upRes.headers.location}`));
+          return;
+        }
+        const blocked = isForbiddenRedirectTarget(next, url);
+        if (blocked) {
+          onResponse(new Error(`Refusing redirect to ${next.href}: ${blocked}`));
           return;
         }
         console.log(`Redirect ${code} → ${next.href}`);
@@ -419,16 +475,29 @@ function pipeOrBufferOk(upRes, res) {
 
   const chunks = [];
   let total = 0;
+  let aborted = false;
   upRes.on('data', (chunk) => {
-    chunks.push(chunk);
+    if (aborted) return;
     total += chunk.length;
+    if (total > MAX_BUFFER_BYTES) {
+      aborted = true;
+      console.error(
+        `Upstream body exceeded buffer cap ${MAX_BUFFER_BYTES} bytes (no Content-Length); aborting`
+      );
+      upRes.destroy();
+      sendEmpty(res, 502);
+      return;
+    }
+    chunks.push(chunk);
   });
   upRes.on('end', () => {
+    if (aborted || res.headersSent || res.writableEnded) return;
     const buf = Buffer.concat(chunks, total);
     console.log(`Buffered ${buf.length} bytes (no upstream Content-Length)`);
     sendBodyWithLength(res, 200, contentType, buf);
   });
   upRes.on('error', (err) => {
+    if (aborted) return;
     console.error(`Upstream buffer error: ${err.message}`);
     sendEmpty(res, 502);
   });
@@ -532,17 +601,41 @@ const server = http.createServer((req, res) => {
 
     settled = true;
     if (method === 'HEAD') {
-      discardBody(upRes);
       const contentType = upRes.headers['content-type'] || 'application/octet-stream';
       const lenHeader = upRes.headers['content-length'];
-      res.statusCode = 200;
-      res.setHeader('Content-Type', contentType);
       if (lenHeader && /^\d+$/.test(String(lenHeader))) {
+        discardBody(upRes);
+        res.statusCode = 200;
+        res.setHeader('Content-Type', contentType);
         res.setHeader('Content-Length', String(lenHeader));
-      } else {
-        res.setHeader('Content-Length', '0');
+        res.end();
+        return;
       }
-      res.end();
+      // No Content-Length: count bytes while discarding so HEAD does not lie with 0.
+      let total = 0;
+      let aborted = false;
+      upRes.on('data', (chunk) => {
+        if (aborted) return;
+        total += chunk.length;
+        if (total > MAX_BUFFER_BYTES) {
+          aborted = true;
+          upRes.destroy();
+          console.error(`HEAD count exceeded buffer cap ${MAX_BUFFER_BYTES}; aborting`);
+          sendEmpty(res, 502);
+        }
+      });
+      upRes.on('end', () => {
+        if (aborted || res.headersSent || res.writableEnded) return;
+        res.statusCode = 200;
+        res.setHeader('Content-Type', contentType);
+        res.setHeader('Content-Length', String(total));
+        res.end();
+      });
+      upRes.on('error', (err) => {
+        if (aborted) return;
+        console.error(`HEAD upstream error: ${err.message}`);
+        sendEmpty(res, 502);
+      });
       return;
     }
 
