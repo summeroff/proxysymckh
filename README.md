@@ -85,7 +85,7 @@ SYMCHK: PASSED + IGNORED files = 1
 | After upstream miss on `.pd_` / `file.ptr` | folder cached; later probes **`403`** | Stop `file.ptr` / retries without S3 |
 | Deny-list stem (`kernel32.pdb`, …) | **`403`** for `.pdb`/`.pd_`/`file.ptr` | Never on private store; stop family |
 | `index2.txt` / `pingme.txt` | **`403`** | Useless on private S3 |
-| redirect (3xx) | followed (max 5); blocks loopback/RFC1918/link-local targets | SSRF guard; public S3/CloudFront hops OK |
+| redirect (3xx) | followed (max 5); cross-host hops DNS-checked; private/link-local/metadata blocked | SSRF guard; same-host + public S3/CloudFront OK |
 | body without `Content-Length` | buffered up to 512 MiB, then 502 | Avoids unbounded memory |
 | client disconnect | upstream aborted | |
 

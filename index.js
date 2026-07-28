@@ -4,6 +4,7 @@ const http = require('http');
 const https = require('https');
 const { URL } = require('url');
 const net = require('net');
+const dns = require('dns').promises;
 
 const DEFAULT_PORT = 3000;
 const UPSTREAM_TIMEOUT_MS = 60_000;
@@ -30,6 +31,10 @@ try {
   remoteBase = new URL(remoteServerUrl.includes('://') ? remoteServerUrl : `https://${remoteServerUrl}`);
 } catch (err) {
   console.error(`Invalid remote-server-url: ${remoteServerUrl}`);
+  process.exit(1);
+}
+if (remoteBase.protocol !== 'http:' && remoteBase.protocol !== 'https:') {
+  console.error(`remote-server-url must be http(s); got ${remoteBase.protocol}`);
   process.exit(1);
 }
 
@@ -335,48 +340,89 @@ function sendEmpty(res, statusCode) {
 
 /**
  * Block open redirects into unexpected private targets (SSRF).
- * Always allow hops that stay on the configured upstream host or the current
- * response host (so local dev + same-host S3 redirects work). Cross-host hops
- * must be public http(s) only.
+ * - Same host as configured upstream or current hop: allowed (local dev / same-host S3).
+ * - Cross-host: http(s) only; block loopback/RFC1918/link-local/metadata IP literals,
+ *   and DNS-resolve hostnames so private A/AAAA records cannot sneak through.
  */
-function isForbiddenRedirectTarget(nextUrl, fromUrl) {
-  if (nextUrl.protocol !== 'http:' && nextUrl.protocol !== 'https:') {
-    return `unsupported protocol ${nextUrl.protocol}`;
-  }
-  if (nextUrl.username || nextUrl.password) {
-    return 'URL userinfo not allowed';
-  }
-  const host = (nextUrl.hostname || '').toLowerCase().replace(/^\[|\]$/g, '');
-  if (!host) return 'empty host';
+function normalizeHost(hostname) {
+  return (hostname || '').toLowerCase().replace(/^\[|\]$/g, '');
+}
 
-  const configured = (remoteBase.hostname || '').toLowerCase().replace(/^\[|\]$/g, '');
-  const previous = (fromUrl.hostname || '').toLowerCase().replace(/^\[|\]$/g, '');
-  if (host === configured || host === previous) {
-    return null;
-  }
-
+function isBlockedIpLiteral(host) {
   if (host === 'localhost' || host.endsWith('.localhost') || host === 'metadata.google.internal') {
     return `blocked host ${host}`;
   }
-
   if (net.isIP(host) === 4) {
     const [a, b] = host.split('.').map((x) => parseInt(x, 10));
     if (a === 0 || a === 10 || a === 127) return `blocked IPv4 ${host}`;
     if (a === 169 && b === 254) return `blocked IPv4 ${host}`;
     if (a === 192 && b === 168) return `blocked IPv4 ${host}`;
     if (a === 172 && b >= 16 && b <= 31) return `blocked IPv4 ${host}`;
-  } else if (net.isIP(host) === 6) {
+    return null;
+  }
+  if (net.isIP(host) === 6) {
     const h = host.toLowerCase();
     if (h === '::1' || h.startsWith('fe80:') || h.startsWith('fc') || h.startsWith('fd')) {
       return `blocked IPv6 ${host}`;
     }
+    // IPv4-mapped :ffff:a.b.c.d
     if (h.includes('.')) {
       const m = h.match(/(\d+\.\d+\.\d+\.\d+)$/);
-      if (m) {
-        const fake = new URL(`http://${m[1]}/`);
-        const why = isForbiddenRedirectTarget(fake, fromUrl);
-        if (why) return why;
-      }
+      if (m) return isBlockedIpLiteral(m[1]);
+    }
+    return null;
+  }
+  return null;
+}
+
+function isForbiddenRedirectTargetSync(nextUrl, fromUrl) {
+  if (nextUrl.protocol !== 'http:' && nextUrl.protocol !== 'https:') {
+    return `unsupported protocol ${nextUrl.protocol}`;
+  }
+  if (nextUrl.username || nextUrl.password) {
+    return 'URL userinfo not allowed';
+  }
+  const host = normalizeHost(nextUrl.hostname);
+  if (!host) return 'empty host';
+
+  const configured = normalizeHost(remoteBase.hostname);
+  const previous = normalizeHost(fromUrl.hostname);
+  if (host === configured || host === previous) {
+    return null;
+  }
+
+  const lit = isBlockedIpLiteral(host);
+  if (lit) return lit;
+  return null;
+}
+
+/**
+ * Async SSRF check: after sync rules, resolve cross-host names and reject private A/AAAA.
+ * @returns {Promise<string|null>} error reason or null if allowed
+ */
+async function assertRedirectAllowed(nextUrl, fromUrl) {
+  const sync = isForbiddenRedirectTargetSync(nextUrl, fromUrl);
+  if (sync) return sync;
+
+  const host = normalizeHost(nextUrl.hostname);
+  const configured = normalizeHost(remoteBase.hostname);
+  const previous = normalizeHost(fromUrl.hostname);
+  if (host === configured || host === previous) return null;
+  if (net.isIP(host)) return null; // already covered by sync IP rules
+
+  let addrs;
+  try {
+    addrs = await dns.lookup(host, { all: true, verbatim: true });
+  } catch (err) {
+    return `DNS lookup failed for ${host}: ${err.message}`;
+  }
+  if (!addrs || addrs.length === 0) {
+    return `DNS lookup returned no addresses for ${host}`;
+  }
+  for (const { address } of addrs) {
+    const why = isBlockedIpLiteral(address);
+    if (why) {
+      return `hostname ${host} resolves to ${address} (${why})`;
     }
   }
   return null;
@@ -407,14 +453,17 @@ function upstreamGet(url, redirectsLeft, onResponse) {
           onResponse(new Error(`Bad redirect Location: ${upRes.headers.location}`));
           return;
         }
-        const blocked = isForbiddenRedirectTarget(next, url);
-        if (blocked) {
-          onResponse(new Error(`Refusing redirect to ${next.href}: ${blocked}`));
-          return;
-        }
-        console.log(`Redirect ${code} → ${next.href}`);
-        const child = upstreamGet(next, redirectsLeft - 1, onResponse);
-        req._proxysymChild = child;
+        assertRedirectAllowed(next, url).then((blocked) => {
+          if (blocked) {
+            onResponse(new Error(`Refusing redirect to ${next.href}: ${blocked}`));
+            return;
+          }
+          console.log(`Redirect ${code} → ${next.href}`);
+          const child = upstreamGet(next, redirectsLeft - 1, onResponse);
+          req._proxysymChild = child;
+        }).catch((err) => {
+          onResponse(err instanceof Error ? err : new Error(String(err)));
+        });
         return;
       }
       onResponse(null, upRes);
