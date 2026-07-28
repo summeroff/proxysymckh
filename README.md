@@ -6,7 +6,7 @@ Local HTTP proxy in front of a private symbol store (often S3) so **symchk** and
 
 1. **403 on missing keys** — S3 with `ListBucket` disabled returns `403` for objects that do not exist. `symchk` / VS treat `403` as “stop” and never try the compressed `.pd_` twin. A `404` makes them continue.
 2. **Chunked responses** — `symchk` does not handle `Transfer-Encoding: chunked`. This proxy always answers successful downloads with a real **`Content-Length`** (stream when upstream provides length; otherwise buffer then send).
-3. **Noisy system / third-party PDB traffic** — a deny list of Windows, MSVC, NVIDIA, CEF, … **symbol stems** (`name.pdb`) returns local **`403`** for the whole SymSrv family (`.pdb` / `.pd_` / `file.ptr`) so clients **stop probing**. That is different from upstream-miss **`404`**, which must stay so first-party `.pd_` twins are still tried.
+3. **Noisy system / third-party PDB traffic** — a deny list of Windows, MSVC, NVIDIA driver, … **symbol stems** (`name.pdb`) returns local **`403`** for the whole SymSrv family (`.pdb` / `.pd_` / `file.ptr`) so clients **stop probing**. That is different from upstream-miss **`404`**, which must stay so first-party `.pd_` twins are still tried. First-party / private CEF (`obs*`, `libobs*`, `libcef.dll`, …) are **not** denied.
 4. **Negative cache** — after an upstream miss on `.pd_` (or `file.ptr`) for `name.pdb/<GUID>/…`, further probes under that folder get local **`403`** for the rest of the process (1h TTL).
 
 No npm dependencies — Node.js standard library only.
@@ -93,7 +93,7 @@ SYMCHK: PASSED + IGNORED files = 1
 - **`404` to client** = “not this file; try the compressed twin / next name” (needed for product PDBs on S3).
 - **`403` to client** = “stop looking under this symbol” (deny list + negative cache).
 
-Deny stems live in `DENY_STEMS` in `index.js`. Add names you know will never be uploaded; do **not** add first-party stems (`obs*`, `libobs*`, `win-capture`, …).
+Deny stems live in `DENY_STEMS` in `index.js`. Add names you know will never be uploaded; do **not** add first-party stems (`obs*`, `libobs*`, `libcef.dll`, `win-capture`, …).
 
 ## License
 

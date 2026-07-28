@@ -203,9 +203,8 @@ const DENY_STEMS = new Set(
     'nvEncodeAPI64.pdb',
     'NvVirtualCameraFilter_x64.pdb',
 
-    // CEF / Chromium shipping beside the app but not on private store
-    'libcef.dll.pdb',
-    'chrome_elf.dll.pdb',
+    // NOTE: libcef.dll.pdb / chrome_elf.dll.pdb are NOT denied — Streamlabs ships
+    // a private CEF build and uploads those PDBs to the product symbol store.
 
     // Other third-party never on store (from real traffic)
     'libcrypto-1_1-x64.pdb',
